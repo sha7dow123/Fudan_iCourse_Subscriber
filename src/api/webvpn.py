@@ -299,12 +299,22 @@ class WebVPNSession:
         data = resp.json()
 
         if str(data.get("code")) != "200":
+            print(f"    authExecute error response: {resp.text[:800]}")
             raise RuntimeError(
                 f"iCourse CAS auth failed (code={data.get('code')})"
             )
 
-        login_token = data.get("loginToken", "")
+        # loginToken historically sat at the top level; accept a nested
+        # data.loginToken too in case the IDP restructured the payload.
+        login_token = (
+            data.get("loginToken")
+            or (data.get("data") or {}).get("loginToken")
+            or ""
+        )
         if not login_token:
+            # Dump the raw response so the next run reveals what the IDP
+            # actually returned (e.g. a new captcha/MFA flag).
+            print(f"    authExecute response: {resp.text[:800]}")
             raise RuntimeError("No loginToken in iCourse CAS response")
         print("    loginToken: OK")
 
