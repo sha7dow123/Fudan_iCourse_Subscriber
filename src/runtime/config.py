@@ -2,6 +2,9 @@ import os
 
 STUDENT_ID = os.environ.get("StuId", "")
 PASSWORD = os.environ.get("UISPsw", "")
+# Base32 TOTP secret for the iCourse second-factor (动态口令/OTP).
+# Set when iCourse requires MFA; leave empty to skip the OTP step.
+TOTP_SECRET = os.environ.get("TOTP_SECRET", "").strip()
 
 WEBVPN_BASE = "https://webvpn.fudan.edu.cn"
 IDP_BASE = "https://id.fudan.edu.cn"

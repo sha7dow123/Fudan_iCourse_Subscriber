@@ -172,6 +172,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
         run: python -u main.py
 
       - name: Deploy database to data branch

@@ -19,6 +19,15 @@ vosk-model-*/
 .idea/
 .playwright-mcp/
 
+# Browser cookie exports (contain live session tokens — NEVER commit)
+*_cookies.txt
+cookies.txt
+
+# DevTools HAR captures (contain session tokens) — never commit
+download
+download2
+*.har
+
 任务描述.md
 任务描述2.md
 get_course_text/

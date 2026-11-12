@@ -6,8 +6,13 @@ Handles:
 - Full 7-step IDP authentication flow against id.fudan.edu.cn
 """
 
+import base64
+import hashlib
+import hmac
 import html as html_mod
 import re
+import struct
+import time
 from binascii import hexlify, unhexlify
 from urllib.parse import urlparse, urlencode, quote, urljoin
 
@@ -15,7 +20,6 @@ import requests
 from Crypto.Cipher import AES
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
-import base64
 
 from src.runtime import config
 
@@ -112,6 +116,17 @@ def get_ordinary_url(vpn_url: str) -> str:
     return original
 
 
+def generate_totp(secret: str, digits: int = 6, period: int = 30) -> str:
+    """RFC 6238 TOTP code (HMAC-SHA1) for the given base32 secret."""
+    key = base64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8))
+    counter = int(time.time()) // period
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
 class WebVPNSession:
     """Manages a WebVPN session with full IDP authentication."""
 
@@ -184,12 +199,14 @@ class WebVPNSession:
         print("[*] Starting iCourse CAS authentication through WebVPN...")
 
         # Pre-flight: probe the WebVPN portal.  A cold session redirects to
-        # /login instantly (status 302); a hot session returns 200.  Fail
-        # fast on cold — login_with_retry() in main.py will re-login.
+        # /login; a hot session returns 200 or redirects to a non-login page
+        # (the portal may 302 to its default landing page even when logged in).
         warmup = self.session.get(
             config.WEBVPN_BASE + "/", allow_redirects=False, timeout=5,
         )
-        if warmup.status_code != 200:
+        location = (warmup.headers.get("Location") or "").lower()
+        print(f"    warmup: status={warmup.status_code} location={location[:80]}")
+        if warmup.status_code in (301, 302) and "login" in location:
             raise RuntimeError("WebVPN session cold — re-login needed")
 
         idp_vpn_base = get_vpn_url(config.IDP_BASE)
@@ -304,13 +321,19 @@ class WebVPNSession:
                 f"iCourse CAS auth failed (code={data.get('code')})"
             )
 
-        # loginToken historically sat at the top level; accept a nested
-        # data.loginToken too in case the IDP restructured the payload.
-        login_token = (
-            data.get("loginToken")
-            or (data.get("data") or {}).get("loginToken")
-            or ""
-        )
+        if data.get("second") or data.get("pageLevelNo") == 2:
+            print("    Second factor required (MFA).")
+            login_token = self._complete_second_factor(
+                data, student_id, lck, entity_id, request_type, idp_vpn_base,
+            )
+        else:
+            # loginToken historically sat at the top level; accept a nested
+            # data.loginToken too in case the IDP restructured the payload.
+            login_token = (
+                data.get("loginToken")
+                or (data.get("data") or {}).get("loginToken")
+                or ""
+            )
         if not login_token:
             # Dump the raw response so the next run reveals what the IDP
             # actually returned (e.g. a new captcha/MFA flag).
@@ -376,6 +399,78 @@ class WebVPNSession:
 
         print("    Could not verify iCourse auth via API, proceeding...")
         return True
+
+    def _complete_second_factor(
+        self,
+        first_resp: dict,
+        student_id: str,
+        lck: str,
+        entity_id: str,
+        request_type: str,
+        idp_vpn_base: str,
+    ) -> str:
+        """Submit the TOTP second factor after the IDP returns ``second:true``.
+
+        The first authExecute (userAndPwd) succeeded but withheld loginToken;
+        this submits the current 6-digit TOTP code for ``userAndOtp`` and
+        returns the resulting loginToken.
+        """
+        module_codes = first_resp.get("moduleCodes") or []
+        if "userAndOtp" not in module_codes:
+            raise RuntimeError(
+                f"No automatable second factor (moduleCodes={module_codes})"
+            )
+
+        secret = config.TOTP_SECRET
+        if not secret:
+            raise RuntimeError(
+                "iCourse requires OTP second factor but TOTP_SECRET is not set"
+            )
+
+        code = generate_totp(secret)
+        print(f"    OTP code generated: {code}")
+
+        url = get_vpn_url(f"{config.IDP_BASE}/idp/authn/authExecute")
+        payload = {
+            "authModuleCode": "userAndOtp",
+            "authChainCode": first_resp.get("authChainCode", ""),
+            "entityId": entity_id,
+            "requestType": request_type,
+            "lck": lck,
+            "authPara": {
+                "loginName": student_id,
+                "otpCode": code,
+            },
+        }
+        request_number = first_resp.get("requestNumber", "")
+        if request_number:
+            payload["requestNumber"] = request_number
+
+        resp = self.session.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Referer": f"{idp_vpn_base}/ac/",
+                "Origin": config.WEBVPN_BASE,
+            },
+            timeout=60,
+        )
+        data = resp.json()
+
+        if str(data.get("code")) != "200":
+            print(f"    OTP error response: {resp.text[:800]}")
+            raise RuntimeError(f"OTP auth failed (code={data.get('code')})")
+
+        token = (
+            data.get("loginToken")
+            or (data.get("data") or {}).get("loginToken")
+            or ""
+        )
+        if not token:
+            print(f"    OTP response: {resp.text[:800]}")
+            raise RuntimeError("No loginToken in OTP response")
+        return token
 
     def get(self, url: str, **kwargs) -> requests.Response:
         """GET request through WebVPN. Converts URL automatically."""
@@ -533,6 +628,7 @@ class WebVPNSession:
         data = resp.json()
 
         if str(data.get("code")) != "200":
+            print(f"    authExecute error response: {resp.text[:800]}")
             raise RuntimeError(
                 f"Authentication failed (code={data.get('code')})"
             )
@@ -583,17 +679,32 @@ class WebVPNSession:
         return ticket_url
 
     def _establish_session(self, ticket_url: str):
-        """Step 7: Follow the ticket URL to establish WebVPN session."""
+        """Step 7: Follow the ticket URL to establish WebVPN session.
+
+        Success is signalled by the ``wengine_vpn_ticket`` cookie actually
+        being present — a 200 without it means the ticket was already
+        consumed (e.g. by a timed-out prior attempt) and we landed on /login.
+        """
         for attempt in range(3):
             try:
                 resp = self.session.get(
                     ticket_url, allow_redirects=True, timeout=20
                 )
-                if resp.status_code == 200:
+                has_ticket = any(
+                    "wengine_vpn_ticket" in c.name
+                    for c in self.session.cookies
+                )
+                if has_ticket:
                     print("    Session established.")
                     return
+                print(
+                    f"    No ticket cookie (status={resp.status_code}), "
+                    f"retrying ({attempt + 2}/3)..."
+                )
+                if attempt < 2:
+                    continue
                 raise RuntimeError(
-                    f"Failed to establish WebVPN session (status={resp.status_code})"
+                    "Failed to establish WebVPN session (no ticket cookie)"
                 )
             except requests.exceptions.Timeout:
                 has_ticket = any(
